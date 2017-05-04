@@ -1,0 +1,908 @@
+CREATE OR REPLACE PACKAGE BODY APPS."XXSCM_MK_WEIGHTDIM_PKG" 
+
+AS
+
+   /* REM  ==============================================================================================================
+
+     REM PROGRAM NAME : XXSCM_MK_WEIGHTDIM_PKG
+
+      REM
+
+      REM PURPOSE : Weight Analysis Table
+
+      REM CALLING FORMAT start
+
+ 
+   PROCEDURE P_log_msg (p_i_msg IN VARCHAR2)
+
+   AS
+
+   BEGIN
+
+      --DBMS_OUTPUT.put_line (p_i_msg);
+
+      fnd_file.put_line (fnd_file.LOG, p_i_msg);
+
+   END P_log_msg;
+
+ 
+
+ 
+
+   PROCEDURE p_insert_glb_tb (p_i_rundays IN NUMBER, p_i_group_id IN NUMBER)
+
+   AS
+
+   BEGIN
+
+      INSERT INTO XXSCM_GENERIC_TEMP (GROUP_ID,
+
+                                      INVENTORY_ITEM_ID,
+
+                                      ITEM_SEGMENT,
+
+                                      --                 DESCRIPTION,
+
+                                      UOM_CODE,
+
+                                      QUANTITY,
+
+                                      N_COLUMN1,                 -- min weight
+
+                                      N_COLUMN2,                 -- max weight
+
+                                      --               N_COLUMN3,
+
+                                      --              N_COLUMN4,
+
+                                      N_COLUMN5,                 -- avg weight
+
+                                      N_COLUMN6,              -- std Deviation
+
+                                      N_COLUMN7,              -- no of samples
+
+                                      --N_COLUMN8,
+
+                                      N_COLUMN9                -- run for days
+
+                                               )
+
+           SELECT /*+ leading( b a ) */
+
+                 p_i_group_id,
+
+                  (SELECT inventory_item_id
+
+                     FROM mtl_system_items_b
+
+                    WHERE segment1 = A.model_number AND organization_id = 1)
+
+                     ITEM_ID,
+
+                  A.model_number ITEM_NAME,
+
+                  'LBS' UOM,
+
+                  1 QUANTITY,
+
+                  MIN (b.weight / packout_quantity) MINIMUM_WEIGHT,
+
+                  MAX (b.weight / packout_quantity) MAXIMUM_WEIGHT,
+
+                  AVG (b.weight / packout_quantity) average_weight,
+
+                  STDDEV (b.weight / packout_quantity) standard_deviation,
+
+                  SUM (cnt_box) number_of_samples,
+
+                  p_i_rundays
+
+             FROM xxscm_mk_sg_packout A,
+
+                  (  SELECT SUM (weight * uom.conversion_rate) weight,
+
+                            packout_number,
+
+                            COUNT (DISTINCT NVL (parent_carton_id, carton_id))
+
+                               cnt_box,
+
+                            sgc.po_number
+
+                       FROM xxscm_mk_sg_carton sgc, mtl_uom_conversions uom
+
+                      WHERE     TRUNC (packout_Date) > SYSDATE - p_i_rundays
+
+                            AND sgc.carton_weight_uom IN ('LBS', 'KG')
+
+                            AND sgc.carton_weight_uom = uom.uom_code
+
+                            AND weight IS NOT NULL
+
+                            AND weight <> 0
+
+                            AND uom.uom_class = 'WEIGHT'
+
+                            AND NVL (sgc.package_type, 'CRT') = 'CRT'
+
+                   GROUP BY sgc.packout_number, sgc.po_number
+
+                   UNION
+
+                     SELECT /*+ leading( sgc plt uom ) */
+
+                           SUM (plt.carton_weight * uom.conversion_rate) weight,
+
+                            sgc.packout_number,
+
+                            COUNT (DISTINCT plt.pallet_number) cnt_box,
+
+                            sgc.po_number
+
+                       FROM (SELECT carton_id, packout_number, po_number
+
+                               FROM xxscm_mk_sg_carton
+
+                              WHERE     TRUNC (packout_Date) >
+
+                                           SYSDATE - p_i_rundays
+
+                                    AND package_type = 'PLT') sgc,
+
+                            xxscm.xxscm_mk_sg_pallet plt,
+
+                            mtl_uom_conversions uom
+
+                      WHERE     1 = 1
+
+                            AND plt.pallet_number = sgc.carton_id
+
+                            AND plt.carton_weight IS NOT NULL
+
+                            AND plt.carton_weight <> 0
+
+                            AND plt.packout_number = sgc.packout_number
+
+                            AND uom.uom_code =
+
+                                   DECODE (plt.carton_weight_uom,
+
+                                           'USP', 'LBS',
+
+                                           'KIG', 'KG',
+
+                                           plt.carton_weight_uom)
+
+                            AND uom.uom_class = 'WEIGHT'
+
+                           AND plt.carton_weight_uom IN ('USP', 'LBS', 'KIG')
+
+                   GROUP BY sgc.packout_number, sgc.po_number) b
+
+            WHERE     A.packout_number = b.packout_number
+
+                  AND A.po_number = b.po_number
+
+         GROUP BY model_number;
+
+ 
+
+      COMMIT;
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND
+
+      THEN
+
+         P_log_msg (
+
+            ' Procedure p_insert_glb_tb Failed while inserting record into XXSCM_GENERIC_TEMP table ');
+
+      WHEN OTHERS
+
+      THEN
+
+         P_log_msg (
+
+               'Others Error in Procedure p_insert_glb_tb Failed while inserting record into XXSCM_GENERIC_TEMP table  :'
+
+            || SQLERRM);
+
+   END p_insert_glb_tb;
+
+ 
+
+   FUNCTION f_min_max_thr (p_i_type            IN VARCHAR2,
+
+                           p_i_std_deviation   IN FLOAT,
+
+                           p_i_z_val           IN FLOAT,
+
+                           p_i_avg             IN FLOAT,
+
+                           p_i_pid_cnt         IN NUMBER)
+
+      RETURN NUMBER
+
+   AS
+
+      l_threshold   NUMBER := 0;
+
+   BEGIN
+
+      IF p_i_type = 'MAX'
+
+      THEN
+
+         l_threshold :=
+
+            p_i_avg + (p_i_z_val * (p_i_std_deviation / SQRT (p_i_pid_cnt)));
+
+      ELSIF p_i_type = 'MIN'
+
+      THEN
+
+         l_threshold :=
+
+            p_i_avg - (p_i_z_val * (p_i_std_deviation / SQRT (p_i_pid_cnt)));
+
+      END IF;
+
+ 
+
+      RETURN ROUND (l_threshold, 3);
+
+   EXCEPTION
+
+      WHEN OTHERS
+
+      THEN
+
+         P_log_msg (
+
+               'Other Error in put to f_min_max_thr p_i_type'
+
+            || p_i_type
+
+            || '   p_i_std_deviation'
+
+            || p_i_std_deviation
+
+            || ' p_i_z_val'
+
+            || p_i_z_val
+
+            || ' p_i_avg'
+
+            || p_i_avg
+
+            || ' p_i_pid_cnt'
+
+            || p_i_pid_cnt);
+
+ 
+
+         P_log_msg (
+
+               'Others ERROR WHILE getting f_min_max_thr Value :'
+
+            || SQLERRM
+
+            || '   Code :'
+
+            || SQLCODE);
+
+ 
+
+         RETURN ROUND (l_threshold, 3);
+
+   END f_min_max_thr;
+
+ 
+
+   FUNCTION f_z_value (p_i_confidence IN VARCHAR2)
+
+      RETURN NUMBER
+
+   AS
+
+      l_z_val   NUMBER := 0;
+
+   BEGIN
+
+      BEGIN
+
+         SELECT character2 z_statistics_value
+
+           INTO l_z_val
+
+           FROM qa_plans qp, qa_results qr
+
+          WHERE     NAME = 'XXSCM_MK_WAR_QUALITY_PLAN'
+
+                AND qp.plan_id = qr.plan_id
+
+                AND character1 = p_i_confidence;
+
+      EXCEPTION
+
+         WHEN TOO_MANY_ROWS
+
+         THEN
+
+            l_z_val := 0;
+
+         WHEN NO_DATA_FOUND
+
+         THEN
+
+            l_z_val := 0;
+
+         WHEN OTHERS
+
+         THEN
+
+            l_z_val := 0;
+
+      END;
+
+ 
+
+      RETURN l_z_val;
+
+   END f_z_value;
+
+ 
+
+ 
+
+   PROCEDURE Main_build_ssot (p_o_errf_buff   OUT VARCHAR2,
+
+                              p_o_retcode     OUT VARCHAR2)
+
+   AS
+
+      l_batch              VARCHAR2 (180) := 2;
+
+      l_end_date_status    VARCHAR2 (4) := 'S';
+
+      l_sample_count       NUMBER := 0;
+
+      l_confidence_level   VARCHAR2 (30) := NULL;
+
+ 
+
+      CURSOR cur_90days_data
+
+      IS
+
+         SELECT inventory_item_id,
+
+                item_segment,
+
+                --                 DESCRIPTION,
+
+                uom_code,
+
+                quantity,
+
+                c_column1 batch_id,
+
+                n_column1 min_weight,
+
+                n_column2 max_weight,
+
+                n_column5 avg_weight,
+
+                n_column6 std_deviation,
+
+                n_column7 no_of_samples,
+
+                n_column9 run_days
+
+           FROM XXSCM_GENERIC_TEMP
+
+          WHERE GROUP_ID = 123;                         -- running for 90 days
+
+   BEGIN
+
+      -- Sample count
+
+      BEGIN
+
+         SELECT TO_NUMBER (meaning)
+
+           INTO l_sample_count
+
+           FROM fnd_Lookup_values
+
+          WHERE     lookup_type = 'XXSCM_MK_WAR_UC_SAMPLE_FREQ'
+
+                AND LANGUAGE = 'US'
+
+                AND lookup_code = 'SAMPLE_COUNT'
+
+                AND enabled_flag = 'Y';
+
+ 
+
+         P_log_msg ('Sample Count :' || l_sample_count);
+
+      EXCEPTION
+
+         WHEN NO_DATA_FOUND
+
+         THEN
+
+            l_sample_count := 15;
+
+         WHEN OTHERS
+
+         THEN
+
+            l_sample_count := 15;
+
+            P_log_msg (
+
+                  'Others ERROR WHILE getting Sample Count Value :'
+
+               || SQLERRM
+
+               || '   Code :'
+
+               || SQLCODE);
+
+      END;
+
+ 
+
+      -- Confidence Level
+
+ 
+
+      BEGIN
+
+         SELECT meaning
+
+           INTO G_confid_level                           --Q4Fy15(AUG)-SCCR670
+
+           FROM fnd_Lookup_values
+
+          WHERE     lookup_type = 'XXSCM_MK_WAR_UC_SAMPLE_FREQ'
+
+                AND LANGUAGE = 'US'
+
+                AND lookup_code = 'USER_CONF'
+
+                AND enabled_flag = 'Y';
+
+ 
+
+         P_log_msg ('User Confidence  :' || l_confidence_level);
+
+      EXCEPTION
+
+         WHEN NO_DATA_FOUND
+
+         THEN
+
+            P_log_msg (' ERROR  User Confidence Setup is not Done.');
+
+            raise_application_error (
+
+               -20001,
+
+               'ERROR  User Confidence Setup is not Built.');
+
+         WHEN OTHERS
+
+         THEN
+
+            l_confidence_level := 90;
+
+            P_log_msg (
+
+                  'Others ERROR WHILE getting User Confidence:'
+
+               || SQLERRM
+
+               || '   Code :'
+
+               || SQLCODE);
+
+ 
+
+            raise_application_error (
+
+               -20001,
+
+               'Others ERROR WHILE getting User Confidence.');
+
+      END;
+
+ 
+
+ 
+
+ 
+
+      P_end_date_prev_run (l_end_date_status);
+
+ 
+
+      P_log_msg ('END Date status   :' || l_end_date_status);
+
+ 
+
+ 
+
+      l_batch := TO_CHAR (SYSDATE, 'YYYYMMDDHHMI');
+
+ 
+
+      p_insert_glb_tb (90, 123);                -- record inserted for 90 days
+
+      p_insert_glb_tb (180, 124);             -- records inserted for 180 days
+
+ 
+
+      --      p_insert_ssot (180, l_batch,124);
+
+ 
+
+ 
+
+      FOR j IN cur_90days_data
+
+      LOOP
+
+         P_log_msg (
+
+               'NO OF sample FOR 90 days run FOR Item AND sample count '
+
+            || j.item_segment
+
+            || ', '
+
+            || j.quantity);
+
+ 
+
+         BEGIN
+
+            l_confidence_level := NULL;
+
+ 
+
+            -- Start Q4Fy15(AUG)-SCCR670
+
+            SELECT NVL (
+
+                      MAX (N_EXT_ATTR1)
+
+                      KEEP (DENSE_RANK FIRST ORDER BY last_update_date DESC),
+
+                      G_confid_level)
+
+              INTO l_confidence_level
+
+              FROM apps.ego_attr_groups_v E, apps.ego_mtl_sy_items_ext_b x
+
+             WHERE     E.attr_group_id = x.attr_group_id
+
+                   AND E.attr_group_name = 'FF_ITEM_ATTR'
+
+                   AND x.inventory_item_id = j.inventory_item_id
+
+                   AND x.organization_id = 1;
+
+         EXCEPTION
+
+            WHEN NO_DATA_FOUND
+
+            THEN
+
+               l_confidence_level := G_confid_level;
+
+            WHEN OTHERS
+
+            THEN
+
+               l_confidence_level := G_confid_level;
+
+         END;
+
+ 
+
+         --END Q4Fy15(AUG)-SCCR670
+
+         IF j.no_of_samples >= l_sample_count
+
+         THEN
+
+            BEGIN
+
+               INSERT INTO xxscm_mk_carton_weight_ssot (batch_id,
+
+                                                        item_id,
+
+                                                        item_name,
+
+                                                        quantity,
+
+                                                        uom,
+
+                                                        minimum_weight,
+
+                                                        maximum_weight,
+
+                                                        min_threshold,
+
+                                                        max_threshold,
+
+                                                        confidence_level,
+
+                                                        average_weight,
+
+                                                        standard_deviation,
+
+                                                        number_of_samples,
+
+                                                        z_value,
+
+                                                        effective_start_date,
+
+                                                        created_by,
+
+                                                        last_updated_by,
+
+                                                        creation_date,
+
+                                                        last_updated_date,
+
+                                                        last_update_login,
+
+                                                        run_days,
+
+                                                        comments)
+
+                  SELECT l_batch,
+
+                         j.inventory_item_id,
+
+                         j.item_segment,
+
+                         j.quantity,
+
+                         j.uom_code,
+
+                         j.min_weight,
+
+                         j.max_weight,
+
+                         f_min_max_thr ('MIN',
+
+                                        j.std_deviation,
+
+                                        f_z_value (l_confidence_level),
+
+                                        j.avg_weight,
+
+                                        j.no_of_samples           --j.quantity
+
+                                                       ),
+
+                         f_min_max_thr ('MAX',
+
+                                        j.std_deviation,
+
+                                        f_z_value (l_confidence_level),
+
+                                        j.avg_weight,
+
+                                        j.no_of_samples           --j.quantity
+
+                                                       ),
+
+                         l_confidence_level,               -- confidence level
+
+                         j.avg_weight,
+
+                         j.std_deviation,
+
+                         j.no_of_samples,                     --no_of_samples,
+
+                         f_z_value (l_confidence_level),
+
+                         SYSDATE,
+
+                         fnd_global.user_id,
+
+                         fnd_global.user_id,
+
+                         SYSDATE,
+
+                         SYSDATE,
+
+                         fnd_global.login_id,
+
+                         j.run_days,                                 --90 days
+
+                         NULL
+
+                    FROM DUAL;
+
+            EXCEPTION
+
+               WHEN OTHERS
+
+               THEN
+
+                  P_log_msg (
+
+                        'INSERT INTO THE xxscm_mk_carton_weight_ssot TABLE got FAILED  FOR 90 days  ERROR :'
+
+                     || SQLERRM);
+
+            END;
+
+         ELSE
+
+            BEGIN
+
+               INSERT INTO xxscm_mk_carton_weight_ssot (batch_id,
+
+                                                        item_id,
+
+                                                        item_name,
+
+                                                        quantity,
+
+                                                        uom,
+
+                                                        minimum_weight,
+
+                                                        maximum_weight,
+
+                                                        min_threshold,
+
+                                                        max_threshold,
+
+                                                        confidence_level,
+
+                                                        average_weight,
+
+                                                        standard_deviation,
+
+                                                        number_of_samples,
+
+                                                        z_value,
+
+                                                        effective_start_date,
+
+                                                        created_by,
+
+                                                        last_updated_by,
+
+                                                        creation_date,
+
+                                                        last_updated_date,
+
+                                                        last_update_login,
+
+                                                        run_days,
+
+                                                        comments)
+
+                  SELECT l_batch,
+
+                         inventory_item_id,
+
+                         item_segment,
+
+                         quantity,
+
+                         uom_code,
+
+                         n_column1,                              --min_weight,
+
+                         n_column2,                              --max_weight,
+
+                         f_min_max_thr ('MIN',
+
+                                        n_column6,           --- std_deviation
+
+                                        f_z_value (l_confidence_level),
+
+                                        n_column5,                --avg weight
+
+                                        n_column7  -- no_of_samples,--quantity
+
+                                                 ),
+
+                         f_min_max_thr ('MAX',
+
+                                        n_column6,           --- std_deviation
+
+                                        f_z_value (l_confidence_level),
+
+                                        n_column5,              --- avg weight
+
+                                        n_column7    -- no_of_samples quantity
+
+                                                 ),
+
+                         l_confidence_level,               -- confidence level
+
+                         n_column5,                             -- avg_weight,
+
+                         n_column6,                          -- std_deviation,
+
+                         n_column7,                          -- no_of_samples,
+
+                         f_z_value (l_confidence_level),
+
+                         SYSDATE,
+
+                         fnd_global.user_id,
+
+                         fnd_global.user_id,
+
+                         SYSDATE,
+
+                         SYSDATE,
+
+                         fnd_global.login_id,
+
+                         n_column9, -- run_days,                              --180 days
+
+                         (CASE
+
+                             WHEN n_column7 >= l_sample_count
+
+                             THEN
+
+                                '2xtimeframe'
+
+                             ELSE
+
+                                'NOT Enough DATA'
+
+                          END)
+
+                            comments
+
+                    FROM XXSCM_GENERIC_TEMP
+
+                   WHERE     inventory_item_id = j.inventory_item_id
+
+                         AND GROUP_ID = 124;
+
+            EXCEPTION
+
+               WHEN OTHERS
+
+               THEN
+
+                  P_log_msg (
+
+                        'INSERT INTO THE xxscm_mk_carton_weight_ssot TABLE got FAILED  FOR 180 days  ERROR :'
+
+                     || SQLERRM);
+
+            END;
+
+         END IF;
+
+      END LOOP;
+
+ 
+
+      COMMIT;
+
+   END Main_build_ssot;
+
+ 
+
+   
